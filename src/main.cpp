@@ -24,6 +24,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -51,7 +52,10 @@ static void usage(FILE* out, const char* prog) {
             "  NAME VALUE        set property NAME as VALUE\n"
             "  -f, --file FILE   load and set properties from FILE\n"
             "  -d, --delete NAME delete property\n"
-            "  -c, --compact [CONTEXT] compact property area files\n\n"
+            "  -c, --rebuild [CONTEXT] rebuild property areas (--compact is an alias)\n"
+            "  --force           rebuild all areas even when no anomalies are found\n"
+            "  -c -Z NAME        rebuild the area containing property NAME\n"
+            "  -c -d NAME        delete NAME and rebuild its area\n\n"
             "Wait mode arguments (toggled with -w):\n"
             "  NAME              wait until property NAME exists or changes\n"
             "  NAME OLD_VALUE    if property NAME is not OLD_VALUE, return immediately;\n"
@@ -81,29 +85,27 @@ using PropertyMap = std::map<std::string, std::string>;
 #if defined(__ANDROID_API__) && __ANDROID_API__ >= 26
 
 struct GetCookie {
-    char* out;
+    std::string* out;
     uint32_t* serial;
     bool done;
 };
 
 static void get_callback(void* cookie, const char* /*name*/, const char* value, uint32_t serial) {
     auto* c = static_cast<GetCookie*>(cookie);
-    if (value) {
-        strncpy(c->out, value, PROP_VALUE_MAX - 1);
-        c->out[PROP_VALUE_MAX - 1] = '\0';
-    }
+    *c->out = value ? value : "";
     if (c->serial != nullptr) {
         *c->serial = serial;
     }
     c->done = true;
 }
 
-static int prop_get(const char* name, char* value, uint32_t* serial = nullptr) {
+static bool prop_get(const char* name, std::string* value, uint32_t* serial = nullptr) {
     const prop_info* pi = __system_property_find(name);
-    if (!pi) return -1;
+    if (!pi)
+        return false;
     GetCookie cb{value, serial, false};
     __system_property_read_callback(pi, get_callback, &cb);
-    return cb.done ? static_cast<int>(strlen(value)) : -1;
+    return cb.done;
 }
 
 static void list_read_callback(void* cookie, const char* name, const char* value, uint32_t /*serial*/) {
@@ -118,12 +120,17 @@ static void list_foreach_callback(const prop_info* pi, void* cookie) {
 
 #else  // API < 26: use deprecated __system_property_read
 
-static int prop_get(const char* name, char* value, uint32_t* /*serial*/ = nullptr) {
+static bool prop_get(const char* name, std::string* value, uint32_t* /*serial*/ = nullptr) {
     const prop_info* pi = __system_property_find(name);
-    if (!pi) return -1;
+    if (!pi)
+        return false;
     char name_buf[PROP_NAME_MAX];
-    int ret = __system_property_read(pi, name_buf, value);
-    return ret > 0 ? ret : -1;
+    char value_buf[PROP_VALUE_MAX] = {};
+    const int ret = __system_property_read(pi, name_buf, value_buf);
+    if (ret < 0)
+        return false;
+    *value = value_buf;
+    return true;
 }
 
 static void list_foreach_callback(const prop_info* pi, void* cookie) {
@@ -141,7 +148,7 @@ static void list_foreach_callback(const prop_info* pi, void* cookie) {
 #endif
 
 constexpr const char* kPropertyDir = PROP_DIRNAME;
-constexpr const char* kAppcompatDir = "/dev/__properties__/appcompat_override";
+constexpr const char* kAppcompatDir = PROP_DIRNAME "/appcompat_override";
 constexpr const char* kAppcompatPrefix = "ro.appcompat_override.";
 constexpr mode_t kWritableMode = 0644;
 constexpr mode_t kReadonlyMode = 0444;
@@ -420,6 +427,7 @@ using SystemPropertyWaitFn = bool (*)(const prop_info*, uint32_t, uint32_t*, con
 using SystemPropertyAreaSerialFn = uint32_t (*)();
 
 struct Options {
+    bool help = false;
     bool verbose = false;
     bool wait_mode = false;
     bool persist = false;
@@ -430,9 +438,10 @@ struct Options {
     bool show_serial_path = false;
     bool skip_svc = false;
     bool delete_mode = false;
-    bool compact_mode = false;
+    bool rebuild_mode = false;
+    bool force = false;
     const char* file = nullptr;
-    std::optional<double> timeout_seconds;
+    std::optional<std::chrono::steady_clock::duration> timeout;
     std::vector<const char*> positional;
 };
 
@@ -525,14 +534,22 @@ static SystemPropertyAreaSerialFn resolve_property_area_serial() {
     return cached_area_serial;
 }
 
-static bool parse_double_arg(const char* text, double* value) {
+static bool parse_timeout(const char* text, std::chrono::steady_clock::duration* value) {
     char* end = nullptr;
     errno = 0;
     const double parsed = std::strtod(text, &end);
-    if (errno != 0 || end == text || (end != nullptr && *end != '\0')) {
+    if (errno != 0 || end == text || (end != nullptr && *end != '\0') || !std::isfinite(parsed) ||
+        parsed < 0) {
         return false;
     }
-    *value = parsed;
+    using Duration = std::chrono::steady_clock::duration;
+    const auto ticks = std::chrono::duration<long double, Duration::period>(
+                           std::chrono::duration<long double>(parsed))
+                           .count();
+    if (!std::isfinite(ticks) || ticks >= static_cast<long double>(Duration::max().count())) {
+        return false;
+    }
+    *value = Duration(static_cast<Duration::rep>(ticks));
     return true;
 }
 
@@ -544,9 +561,19 @@ static std::string trim(std::string value) {
 }
 
 static bool parse_options(int argc, char** argv, Options* options, std::string* error) {
+    bool positional = false;
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
+        if (positional) {
+            options->positional.push_back(arg);
+            continue;
+        }
+        if (std::strcmp(arg, "--") == 0) {
+            positional = true;
+            continue;
+        }
         if (std::strcmp(arg, "-h") == 0 || std::strcmp(arg, "--help") == 0) {
+            options->help = true;
             return true;
         }
         if (std::strcmp(arg, "-v") == 0 || std::strcmp(arg, "--verbose") == 0) {
@@ -590,8 +617,13 @@ static bool parse_options(int argc, char** argv, Options* options, std::string* 
             options->delete_mode = true;
             continue;
         }
-        if (std::strcmp(arg, "-c") == 0 || std::strcmp(arg, "--compact") == 0) {
-            options->compact_mode = true;
+        if (std::strcmp(arg, "-c") == 0 || std::strcmp(arg, "--rebuild") == 0 ||
+            std::strcmp(arg, "--compact") == 0) {
+            options->rebuild_mode = true;
+            continue;
+        }
+        if (std::strcmp(arg, "--force") == 0) {
+            options->force = true;
             continue;
         }
         if (std::strcmp(arg, "-f") == 0 || std::strcmp(arg, "--file") == 0) {
@@ -607,15 +639,16 @@ static bool parse_options(int argc, char** argv, Options* options, std::string* 
                 *error = "missing value after --timeout";
                 return false;
             }
-            double timeout = 0;
-            if (!parse_double_arg(argv[++i], &timeout) || timeout < 0) {
+            std::chrono::steady_clock::duration timeout{};
+            if (!parse_timeout(argv[++i], &timeout)) {
                 *error = "invalid timeout value";
                 return false;
             }
-            options->timeout_seconds = timeout;
+            options->timeout = timeout;
             continue;
         }
         options->positional.push_back(arg);
+        positional = true;
     }
 
     return true;
@@ -858,9 +891,7 @@ static bool get_property_value(const Options& options,
     }
 
     if (!options.persist_only) {
-        char raw[PROP_VALUE_MAX] = {};
-        if (prop_get(name, raw) >= 0) {
-            *value = raw;
+        if (prop_get(name, value)) {
             *found = true;
             return true;
         }
@@ -891,7 +922,7 @@ static bool list_properties(const Options& options,
             return false;
         }
         for (const auto& [name, value] : persist_props) {
-            (*properties)[name] = value;
+            properties->emplace(name, value);
         }
     }
 
@@ -1018,17 +1049,17 @@ static bool load_property_file(const Options& options, const char* path, std::st
     return ok;
 }
 
-static bool wait_for_property(const char* name,
-                              const char* old_value,
-                              const std::optional<double>& timeout_seconds,
+static bool wait_for_property(const char* name, const char* old_value,
+                              const std::optional<std::chrono::steady_clock::duration>& timeout,
                               bool* timed_out) {
     *timed_out = false;
-    const auto deadline = timeout_seconds.has_value()
-                              ? std::optional<std::chrono::steady_clock::time_point>(
-                                    std::chrono::steady_clock::now() +
-                                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                        std::chrono::duration<double>(*timeout_seconds)))
-                              : std::nullopt;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    if (timeout.has_value()) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto max = std::chrono::steady_clock::time_point::max();
+        deadline =
+            now.time_since_epoch() > max.time_since_epoch() - *timeout ? max : now + *timeout;
+    }
 
     const auto wait_fn = resolve_property_wait();
     const auto area_serial_fn = resolve_property_area_serial();
@@ -1077,11 +1108,9 @@ static bool wait_for_property(const char* name,
             global_serial = area_serial_fn();
         }
 
-        char value[PROP_VALUE_MAX] = {};
+        std::string value;
         uint32_t prop_serial = 0;
-        const int rc = prop_get(name, value, &prop_serial);
-
-        if (rc < 0 || std::strcmp(value, old_value) != 0) {
+        if (!prop_get(name, &value, &prop_serial) || value != old_value) {
             return true;
         }
 
@@ -1158,34 +1187,35 @@ int resetprop_main(int argc, char** argv) {
     }
     g_verbose = options.verbose;
 
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
-            usage(stderr, prog);
-            return 0;
-        }
+    if (options.help) {
+        usage(stderr, prog);
+        return 0;
     }
 
     const int special_modes = static_cast<int>(options.wait_mode) +
                               static_cast<int>(options.delete_mode) +
-                              static_cast<int>(options.compact_mode) +
                               static_cast<int>(options.file != nullptr);
     if (special_modes > 1) {
         fputs("resetprop: multiple operation modes detected\n", stderr);
+        return 1;
+    }
+    if (options.rebuild_mode && (options.wait_mode || options.file != nullptr)) {
+        fputs("resetprop: only -d can be combined with -c\n", stderr);
         return 1;
     }
     if (options.show_context && options.show_area_path) {
         fputs("resetprop: -Z and -A are mutually exclusive\n", stderr);
         return 1;
     }
-    if (options.persist_only &&
-        (options.delete_mode || options.compact_mode || options.file != nullptr ||
-         options.positional.size() == 2)) {
+    if (options.persist_only && (options.delete_mode || options.rebuild_mode ||
+                                 options.file != nullptr || options.positional.size() == 2)) {
         fputs("resetprop: -P is read-only and cannot be combined with write operations\n", stderr);
         return 1;
     }
     if (options.show_context_type || options.show_serial_path) {
-        if (options.wait_mode || options.delete_mode || options.compact_mode || options.file != nullptr ||
-            !options.positional.empty() || options.show_context || options.show_area_path) {
+        if (options.wait_mode || options.delete_mode || options.rebuild_mode ||
+            options.file != nullptr || !options.positional.empty() || options.show_context ||
+            options.show_area_path) {
             fputs("resetprop: context-inspection flags cannot be combined with other modes\n",
                   stderr);
             return 1;
@@ -1217,8 +1247,7 @@ int resetprop_main(int argc, char** argv) {
         bool timed_out = false;
         if (!wait_for_property(options.positional[0],
                                options.positional.size() == 2 ? options.positional[1] : nullptr,
-                               options.timeout_seconds,
-                               &timed_out)) {
+                               options.timeout, &timed_out)) {
             if (timed_out) {
                 fprintf(stderr, "resetprop: timeout waiting for %s\n", options.positional[0]);
                 return 2;
@@ -1228,45 +1257,52 @@ int resetprop_main(int argc, char** argv) {
         return 0;
     }
 
-    if (options.compact_mode) {
+    if (options.rebuild_mode) {
         if (options.positional.size() > 1) {
             usage(stderr, prog);
             return 1;
         }
-
-        ScopedPropertyWriteAccess access;
-        if (!access.active()) {
-            fputs("resetprop: failed to gain write access to property area\n", stderr);
-            return 1;
+        std::optional<std::string> context;
+        if (!options.positional.empty()) {
+            context = options.positional[0];
+            if ((options.show_context || options.delete_mode) &&
+                !get_property_context_value(options.positional[0], &*context, &error)) {
+                print_error(error);
+                return 1;
+            }
+        }
+        if (options.delete_mode) {
+            if (options.positional.empty()) {
+                usage(stderr, prog);
+                return 1;
+            }
+            bool deleted = false;
+            if (!delete_property_value(options, options.positional[0], &deleted, &error)) {
+                print_error(error);
+                return 1;
+            }
+            if (!deleted) {
+                fprintf(stderr, "resetprop: property not found: %s\n", options.positional[0]);
+                return 1;
+            }
         }
 
-        resetprop::CompactSummary summary;
-        const auto compact_one_dir = [&](const char* dir) -> bool {
-            resetprop::CompactSummary partial;
-            if (!resetprop::compact_property_areas(
-                    dir,
-                    options.positional.empty() ? std::nullopt
-                                               : std::optional<std::string>(options.positional[0]),
-                    &partial,
-                    &error)) {
+        const auto rebuild_one_dir = [&](const char* dir) -> bool {
+            resetprop::RebuildSummary summary;
+            if (!resetprop::rebuild_property_areas(dir, context, options.force, &summary, &error)) {
                 return false;
             }
-            summary.files_scanned += partial.files_scanned;
-            summary.valid_areas += partial.valid_areas;
-            summary.files_compacted += partial.files_compacted;
+            verbose_log("rebuilt " + std::to_string(summary.files_rebuilt) + " property areas");
             return true;
         };
 
-        if (!compact_one_dir(kPropertyDir)) {
-            fprintf(stderr, "resetprop: compact failed: %s\n", error.c_str());
+        if (!rebuild_one_dir(kPropertyDir)) {
+            fprintf(stderr, "resetprop: rebuild failed: %s\n", error.c_str());
             return 1;
         }
-        if (directory_exists(kAppcompatDir) && !compact_one_dir(kAppcompatDir)) {
-            fprintf(stderr, "resetprop: compact failed: %s\n", error.c_str());
-            return 1;
-        }
-        if (summary.files_compacted == 0) {
-            fputs("resetprop: nothing to compact\n", stderr);
+        if (context.has_value() && directory_exists(kAppcompatDir) &&
+            !rebuild_one_dir(kAppcompatDir)) {
+            fprintf(stderr, "resetprop: rebuild failed: %s\n", error.c_str());
             return 1;
         }
         return 0;

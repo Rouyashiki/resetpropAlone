@@ -16,7 +16,7 @@
 #include <optional>
 #include <set>
 #include <string>
-#include <unordered_map>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -214,34 +214,21 @@ struct PropRecord {
     std::string name;
     std::string value;
     std::uint32_t prop_offset = 0;
+    std::uint32_t serial = 0;
     std::uint32_t value_offset = 0;
     bool is_long = false;
 };
 
-struct CompactRecord {
-    std::uint32_t offset = 0;
-    std::uint32_t aligned_size = 0;
-    std::optional<std::uint32_t> referer_data;
-    std::optional<std::uint32_t> refer_off;
-    std::optional<std::uint32_t> long_ref_prop;
+struct AreaAllocation {
+    std::uint32_t offset;
+    std::uint32_t aligned_size;
 };
-
-CompactRecord make_compact_record(std::uint32_t offset, std::uint32_t aligned_size,
-                                  std::optional<std::uint32_t> referer_data = std::nullopt,
-                                  std::optional<std::uint32_t> refer_off = std::nullopt,
-                                  std::optional<std::uint32_t> long_ref_prop = std::nullopt) {
-    CompactRecord record;
-    record.offset = offset;
-    record.aligned_size = aligned_size;
-    record.referer_data = referer_data;
-    record.refer_off = refer_off;
-    record.long_ref_prop = long_ref_prop;
-    return record;
-}
 
 class PropAreaFile {
 public:
     PropAreaFile() = default;
+    PropAreaFile(const PropAreaFile&) = delete;
+    PropAreaFile& operator=(const PropAreaFile&) = delete;
     ~PropAreaFile() {
         if (map_ != nullptr && map_ != MAP_FAILED) {
             munmap(map_, map_size_);
@@ -447,107 +434,135 @@ public:
         return true;
     }
 
-    bool compact(bool* changed, std::string* error) {
+    bool rebuild(bool force, bool* changed, std::string* error) {
         *changed = false;
-
         std::uint32_t bytes_used = 0;
         if (!get_bytes_used(&bytes_used, error)) {
             return false;
         }
-
         const bool has_dirty = has_dirty_backup(error);
         if (!error->empty()) {
             return false;
         }
 
-        std::vector<CompactRecord> records;
+        std::vector<AreaAllocation> allocations;
         if (has_dirty) {
-            records.push_back(make_compact_record(kTrieNodeHeaderSize, kDirtyBackupSize));
+            allocations.push_back({kTrieNodeHeaderSize, kDirtyBackupSize});
         }
-
         std::set<std::uint32_t> seen_nodes;
         std::set<std::uint32_t> seen_props;
         std::set<std::uint32_t> seen_longs;
-        if (!collect_compact_records_from(0, std::nullopt, std::nullopt, &seen_nodes, &seen_props,
-                                          &seen_longs, &records, error)) {
+        if (!collect_allocations_from(0, &seen_nodes, &seen_props, &seen_longs, &allocations,
+                                      error)) {
             return false;
         }
-
-        std::sort(records.begin(), records.end(),
-                  [](const CompactRecord& lhs, const CompactRecord& rhs) {
+        std::sort(allocations.begin(), allocations.end(),
+                  [](const AreaAllocation& lhs, const AreaAllocation& rhs) {
                       return lhs.offset < rhs.offset;
                   });
+        bool abnormal = false;
+        std::uint32_t cursor = 0;
+        for (const auto& allocation : allocations) {
+            if (allocation.offset < cursor || allocation.offset > bytes_used ||
+                allocation.aligned_size > bytes_used - allocation.offset) {
+                *error = "overlapping or out-of-bounds property allocation";
+                return false;
+            }
+            abnormal |= allocation.offset != cursor;
+            cursor = allocation.offset + allocation.aligned_size;
+        }
+        abnormal |= cursor != bytes_used;
 
-        const std::uint32_t initial = has_dirty ? kInitialBytesUsed : kTrieNodeHeaderSize;
-        std::uint32_t cursor = initial;
-        std::size_t first_hole_index = records.size();
-        for (std::size_t i = 0; i < records.size(); ++i) {
-            const auto& record = records[i];
-            if (record.offset > cursor) {
-                first_hole_index = i;
-                break;
+        for (const auto offset : seen_nodes) {
+            TrieNodeRecord node;
+            if (!read_node(offset, &node, error)) {
+                return false;
             }
-            const std::uint32_t end = record.offset + record.aligned_size;
-            if (end > cursor) {
-                cursor = end;
-            }
+            abnormal |= (offset != 0 && node.prop == 0 && node.children == 0) ||
+                        (node.left != 0 && node.left <= offset) ||
+                        (node.right != 0 && node.right <= offset) ||
+                        (node.children != 0 && node.children <= offset) ||
+                        (node.prop != 0 && node.prop <= offset) ||
+                        (node.children == 0 && node.prop != 0 &&
+                         node.prop != offset + kTrieNodeHeaderSize + align_up(node.namelen + 1, 4));
         }
 
-        if (first_hole_index == records.size()) {
-            if (cursor < bytes_used) {
-                if (!write_bytes_used(cursor, error)) {
+        std::vector<PropRecord> properties;
+        for (const auto offset : seen_props) {
+            PropRecord record;
+            if (!read_rebuild_prop_record(offset, &record, error)) {
+                return false;
+            }
+            const bool read_only = record.name.compare(0, 3, "ro.") == 0;
+            const auto value_size = static_cast<std::uint32_t>(record.value.size() + 1);
+            const auto capacity = record.is_long ? align_up(value_size, 4) : kPropValueMax;
+            if (read_only && value_size < capacity) {
+                std::vector<std::uint8_t> tail;
+                if (!read_data(record.value_offset + value_size, capacity - value_size, &tail,
+                               error)) {
                     return false;
                 }
-                dirty_ = true;
-                *changed = true;
+                abnormal |=
+                    std::any_of(tail.begin(), tail.end(), [](std::uint8_t ch) { return ch != 0; });
             }
+            abnormal |= (record.is_long &&
+                         record.value_offset !=
+                             align_up(offset + kPropInfoSize + record.name.size() + 1, 4)) ||
+                        (read_only && (record.serial & 0x00fffffeu & ~kPropInfoLongFlag) != 0);
+            properties.push_back(std::move(record));
+        }
+        if (!force && !abnormal) {
             return true;
         }
 
-        std::unordered_map<std::uint32_t, std::uint32_t> remap;
-        std::uint32_t new_cursor = cursor;
-        for (std::size_t i = first_hole_index; i < records.size(); ++i) {
-            remap.emplace(records[i].offset, new_cursor);
-            new_cursor += records[i].aligned_size;
-        }
-
-        for (std::size_t i = first_hole_index; i < records.size(); ++i) {
-            const auto& record = records[i];
-            const std::uint32_t new_offset = remap[record.offset];
-
-            if (record.referer_data.has_value() && record.refer_off.has_value()) {
-                const auto referer_it = remap.find(*record.referer_data);
-                const std::uint32_t referer_data =
-                    referer_it == remap.end() ? *record.referer_data : referer_it->second;
-                const std::uint32_t field_offset = referer_data + *record.refer_off;
-                std::uint32_t field_value = new_offset;
-                if (record.long_ref_prop.has_value()) {
-                    const auto prop_it = remap.find(*record.long_ref_prop);
-                    const std::uint32_t prop_offset =
-                        prop_it == remap.end() ? *record.long_ref_prop : prop_it->second;
-                    field_value = new_offset - prop_offset;
-                }
-                if (!write_u32_data(field_offset, field_value, error)) {
-                    return false;
-                }
-            }
-
-            if (new_offset != record.offset) {
-                std::vector<std::uint8_t> chunk;
-                if (!read_data(record.offset, record.aligned_size, &chunk, error)) {
-                    return false;
-                }
-                if (!write_bytes_data(new_offset, chunk, error)) {
-                    return false;
-                }
-            }
-        }
-
-        if (!zero_data(new_cursor, bytes_used - new_cursor, error)) {
+        // Assemble a complete replacement before changing the mapped property area.
+        PropAreaFile replacement;
+        replacement.map_size_ = map_size_;
+        replacement.map_ = static_cast<std::uint8_t*>(
+            mmap(nullptr, map_size_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        if (replacement.map_ == MAP_FAILED) {
+            replacement.map_ = nullptr;
+            *error = "failed to allocate replacement property area";
             return false;
         }
-        if (!write_bytes_used(new_cursor, error)) {
+        RawPropAreaHeader header{};
+        header.magic = kPropAreaMagic;
+        header.version = kPropAreaVersion;
+        header.bytes_used = has_dirty ? kInitialBytesUsed : kTrieNodeHeaderSize;
+        std::memcpy(replacement.map_, &header, sizeof(header));
+        if (!replacement.validate_header()) {
+            *error = "invalid replacement property area";
             return false;
+        }
+        for (const auto& property : properties) {
+            bool created = false;
+            if (!replacement.set_property(property.name, property.value, &created, error)) {
+                return false;
+            }
+            if (!created) {
+                *error = "duplicate property name in property area";
+                return false;
+            }
+            std::uint32_t node_offset = 0;
+            std::uint32_t prop_offset = 0;
+            std::uint32_t serial = 0;
+            if (!replacement.traverse_trie(property.name, &node_offset, error) ||
+                !replacement.read_u32_data(node_offset + kNodePropOffset, &prop_offset, error) ||
+                !replacement.read_u32_data(prop_offset, &serial, error) ||
+                !replacement.write_u32_data(
+                    prop_offset, serial | (property.serial & 0x00fffffeu & ~kPropInfoLongFlag),
+                    error)) {
+                return false;
+            }
+        }
+        std::uint32_t new_bytes_used = 0;
+        if (!replacement.get_bytes_used(&new_bytes_used, error)) {
+            return false;
+        }
+        std::memcpy(map_, replacement.map_, kPropAreaHeaderSize + new_bytes_used);
+        if (new_bytes_used < bytes_used) {
+            std::memset(map_ + kPropAreaHeaderSize + new_bytes_used, 0,
+                        bytes_used - new_bytes_used);
         }
         dirty_ = true;
         *changed = true;
@@ -840,6 +855,7 @@ private:
         }
 
         record->prop_offset = prop_offset;
+        record->serial = raw.serial;
         record->is_long = (raw.serial & kPropInfoLongFlag) != 0;
         if (record->is_long) {
             std::uint32_t rel_offset = 0;
@@ -868,6 +884,46 @@ private:
         }
 
         return true;
+    }
+
+    bool read_rebuild_prop_record(std::uint32_t prop_offset, PropRecord* record,
+                                  std::string* error) const {
+        std::size_t absolute_offset = 0;
+        if (!check_range(prop_offset, kPropInfoSize, &absolute_offset, error)) {
+            return false;
+        }
+        if (absolute_offset % alignof(std::uint32_t) != 0) {
+            *error = "unaligned property serial";
+            return false;
+        }
+        const auto* serial_ptr = reinterpret_cast<const std::uint32_t*>(map_ + absolute_offset);
+        for (;;) {
+            const auto serial = __atomic_load_n(serial_ptr, __ATOMIC_ACQUIRE);
+            if ((serial & 1u) != 0) {
+#if defined(__linux__)
+                if (syscall(SYS_futex, serial_ptr, FUTEX_WAIT, serial, nullptr, nullptr, 0) < 0 &&
+                    errno != EAGAIN && errno != EINTR) {
+                    *error =
+                        "failed to wait for property update: " + std::string(std::strerror(errno));
+                    return false;
+                }
+#else
+                std::this_thread::yield();
+#endif
+                continue;
+            }
+
+            std::string read_error;
+            const bool ok = read_prop_record(prop_offset, record, &read_error);
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            if (__atomic_load_n(serial_ptr, __ATOMIC_RELAXED) != serial) {
+                continue;
+            }
+            if (!ok) {
+                *error = std::move(read_error);
+            }
+            return ok;
+        }
     }
 
     bool ensure_traverse_trie(const std::string& key, std::uint32_t* node_offset,
@@ -1259,56 +1315,47 @@ private:
         return true;
     }
 
-    bool collect_compact_records_from(
-        std::uint32_t offset, std::optional<std::uint32_t> referer_data,
-        std::optional<std::uint32_t> refer_off, std::set<std::uint32_t>* seen_nodes,
-        std::set<std::uint32_t>* seen_props, std::set<std::uint32_t>* seen_longs,
-        std::vector<CompactRecord>* records, std::string* error) const {
+    bool collect_allocations_from(std::uint32_t offset, std::set<std::uint32_t>* seen_nodes,
+                                  std::set<std::uint32_t>* seen_props,
+                                  std::set<std::uint32_t>* seen_longs,
+                                  std::vector<AreaAllocation>* allocations,
+                                  std::string* error) const {
         if (!seen_nodes->insert(offset).second) {
-            return true;
+            *error = "cycle or shared node in property trie";
+            return false;
         }
-
         TrieNodeRecord node;
         if (!read_node(offset, &node, error)) {
             return false;
         }
-
-        const std::uint32_t node_size =
-            node.namelen == 0 ? kTrieNodeHeaderSize : (kTrieNodeHeaderSize + node.namelen + 1);
-        records->push_back(
-            make_compact_record(offset, align_up(node_size, 4), referer_data, refer_off));
-
-        if (node.prop != 0 && seen_props->insert(node.prop).second) {
-            PropRecord record;
-            if (!read_prop_record(node.prop, &record, error)) {
+        const auto node_size =
+            node.namelen == 0 ? kTrieNodeHeaderSize : kTrieNodeHeaderSize + node.namelen + 1;
+        allocations->push_back({offset, align_up(node_size, 4)});
+        if (node.prop != 0) {
+            if (!seen_props->insert(node.prop).second) {
+                *error = "shared property record in property trie";
                 return false;
             }
-            records->push_back(
-                make_compact_record(node.prop, align_up(kPropInfoSize + record.name.size() + 1, 4),
-                                    offset, kNodePropOffset));
-            if (record.is_long && seen_longs->insert(record.value_offset).second) {
-                records->push_back(make_compact_record(record.value_offset,
-                                                       align_up(record.value.size() + 1, 4),
-                                                       node.prop, kLongOffsetInInfo, node.prop));
+            PropRecord record;
+            if (!read_rebuild_prop_record(node.prop, &record, error)) {
+                return false;
+            }
+            allocations->push_back(
+                {node.prop, align_up(kPropInfoSize + record.name.size() + 1, 4)});
+            if (record.is_long) {
+                if (!seen_longs->insert(record.value_offset).second) {
+                    *error = "shared long value in property trie";
+                    return false;
+                }
+                allocations->push_back({record.value_offset, align_up(record.value.size() + 1, 4)});
             }
         }
-
-        if (node.left != 0 &&
-            !collect_compact_records_from(node.left, offset, kNodeLeftOffset, seen_nodes,
-                                          seen_props, seen_longs, records, error)) {
-            return false;
+        for (const auto next : {node.left, node.children, node.right}) {
+            if (next != 0 && !collect_allocations_from(next, seen_nodes, seen_props, seen_longs,
+                                                       allocations, error)) {
+                return false;
+            }
         }
-        if (node.children != 0 &&
-            !collect_compact_records_from(node.children, offset, kNodeChildrenOffset, seen_nodes,
-                                          seen_props, seen_longs, records, error)) {
-            return false;
-        }
-        if (node.right != 0 &&
-            !collect_compact_records_from(node.right, offset, kNodeRightOffset, seen_nodes,
-                                          seen_props, seen_longs, records, error)) {
-            return false;
-        }
-
         return true;
     }
 
@@ -1323,13 +1370,16 @@ private:
 
 template <typename Fn>
 bool with_each_valid_prop_area(const std::string& property_dir, const Fn& fn,
-                               CompactSummary* summary, std::string* error) {
+                               RebuildSummary* summary, std::string* error) {
     std::vector<std::string> files;
     if (!collect_prop_area_targets(property_dir, &files, error)) {
         return false;
     }
 
     for (const auto& path : files) {
+        if (path.substr(path.find_last_of('/') + 1) == "properties_serial") {
+            continue;
+        }
         if (summary != nullptr) {
             ++summary->files_scanned;
         }
@@ -1448,11 +1498,11 @@ bool bump_property_area_serial(const std::string& property_dir, std::string* err
     return area.save(error);
 }
 
-bool compact_property_areas(const std::string& property_dir,
-                            const std::optional<std::string>& context, CompactSummary* summary,
-                            std::string* error) {
+bool rebuild_property_areas(const std::string& property_dir,
+                            const std::optional<std::string>& context, bool force,
+                            RebuildSummary* summary, std::string* error) {
     if (summary != nullptr) {
-        *summary = CompactSummary{};
+        *summary = RebuildSummary{};
     }
 
     if (context.has_value()) {
@@ -1483,7 +1533,7 @@ bool compact_property_areas(const std::string& property_dir,
             summary->valid_areas = 1;
         }
         bool changed = false;
-        if (!area.compact(&changed, error)) {
+        if (!area.rebuild(true, &changed, error)) {
             return false;
         }
         if (changed) {
@@ -1491,7 +1541,7 @@ bool compact_property_areas(const std::string& property_dir,
                 return false;
             }
             if (summary != nullptr) {
-                summary->files_compacted = 1;
+                summary->files_rebuilt = 1;
             }
         }
         return true;
@@ -1501,7 +1551,7 @@ bool compact_property_areas(const std::string& property_dir,
         property_dir,
         [&](const std::string&, PropAreaFile* area, std::string* inner_error) {
             bool changed = false;
-            if (!area->compact(&changed, inner_error)) {
+            if (!area->rebuild(force, &changed, inner_error)) {
                 return false;
             }
             if (changed) {
@@ -1509,12 +1559,25 @@ bool compact_property_areas(const std::string& property_dir,
                     return false;
                 }
                 if (summary != nullptr) {
-                    ++summary->files_compacted;
+                    ++summary->files_rebuilt;
                 }
             }
             return true;
         },
         summary, error);
+}
+
+bool compact_property_areas(const std::string& property_dir,
+                            const std::optional<std::string>& context, CompactSummary* summary,
+                            std::string* error) {
+    RebuildSummary rebuilt;
+    const bool ok = rebuild_property_areas(property_dir, context, false, &rebuilt, error);
+    if (summary != nullptr) {
+        summary->files_scanned = rebuilt.files_scanned;
+        summary->valid_areas = rebuilt.valid_areas;
+        summary->files_compacted = rebuilt.files_rebuilt;
+    }
+    return ok;
 }
 
 }  // namespace resetprop
